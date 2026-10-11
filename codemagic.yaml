@@ -1,0 +1,23 @@
+
+workflows:
+  guestlab-android:
+    name: GuestLab APK Builder
+    max_build_duration: 60
+    instance_type: linux_x2
+
+    environment:
+      java: 17
+
+    scripts:
+      - name: Install Gradle 8.9
+        script: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+
+      - name: Build GuestLab APK
+        script: |
+          /tmp/gradle-8.9/bin/gradle -p GuestLab assembleDebug
+
+    artifacts:
+      - GuestLab/app/build/outputs/apk/debug/*.apk
+      
