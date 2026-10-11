@@ -1,0 +1,145 @@
+name: Build EmuHost APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build EmuHost
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Check and extract EmuHost
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f EmuHost.zip || {
+            echo "::error::EmuHost.zip must be in the repository root."
+            find . -maxdepth 3 -type f -print
+            exit 1
+          }
+          unzip -t EmuHost.zip
+          mkdir -p source
+          unzip -oq EmuHost.zip -d source
+          test -f source/EmuHost/settings.gradle.kts
+          test -f source/EmuHost/app/build.gradle.kts
+          test -f source/EmuHost/app/src/main/java/com/example/emuhost/engine/QemuLauncher.kt
+
+      - name: Install Android SDK platform 34
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Patch archived Kotlin build blockers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          base = Path("source/EmuHost/app/src/main/java/com/example/emuhost")
+
+          # Add nestedScroll import if an older archive is used.
+          ui = base / "ui/EmuApp.kt"
+          text = ui.read_text(encoding="utf-8")
+          import_line = "import androidx.compose.ui.input.nestedscroll.nestedScroll"
+          if import_line not in text:
+              anchor = "import androidx.compose.ui.Alignment\n"
+              if anchor not in text:
+                  raise SystemExit("Could not apply nestedScroll import fix")
+              text = text.replace(anchor, anchor + import_line + "\n", 1)
+              ui.write_text(text, encoding="utf-8")
+
+          # Ensure QemuLauncher.start() returns Result<Unit>.
+          launcher = base / "engine/QemuLauncher.kt"
+          text = launcher.read_text(encoding="utf-8")
+          old = "Thread { p.inputStream.bufferedReader().forEachLine(onLog) }.start()"
+          new = (
+              'Thread({ p.inputStream.bufferedReader().useLines { lines -> lines.forEach(onLog) } }, '
+              '"qemu-log-${vm.id}").apply { isDaemon = true }.start()\n        Unit'
+          )
+
+          if old in text:
+              text = text.replace(old, new, 1)
+              launcher.write_text(text, encoding="utf-8")
+          elif 'qemu-log-${vm.id}' not in text or "\n        Unit" not in text:
+              raise SystemExit("Could not apply QemuLauncher return-type fix")
+          PY
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        working-directory: source/EmuHost
+        shell: bash
+        run: |
+          set -uo pipefail
+          gradle --version
+
+          set +e
+          gradle assembleDebug --no-daemon --stacktrace --console=plain \
+            2>&1 | tee "$GITHUB_WORKSPACE/emuhost-build.log"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$status" -ne 0 ]; then
+            echo "===== Build error summary ====="
+            grep -n -A 10 -B 3 -E \
+              'What went wrong:|e: file:|Unresolved reference|Type mismatch|Could not resolve|SDK location not found|Minimum supported Gradle version|BUILD FAILED' \
+              "$GITHUB_WORKSPACE/emuhost-build.log" | head -180 || true
+            exit "$status"
+          fi
+
+      - name: Verify APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find source/EmuHost/app/build/outputs/apk/debug \
+            -maxdepth 1 -type f -name '*.apk' -print
+          find source/EmuHost/app/build/outputs/apk/debug \
+            -maxdepth 1 -type f -name '*.apk' | grep -q . || {
+              echo "::error::No debug APK was found."
+              exit 1
+            }
+
+      - name: Upload EmuHost APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EmuHost-debug-apk
+          path: source/EmuHost/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EmuHost-build-log
+          path: emuhost-build.log
+          if-no-files-found: ignore
+          retention-days: 7
